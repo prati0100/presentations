@@ -1,0 +1,310 @@
+#+title:  Kexec Handover and Live Update
+#+author: Pratyush Yadav <pratyush@kernel.org>
+#+options: TeX:t LaTeX:t skip:nil d:nil todo:t pri:nil tags:not-in-toc
+#+options: H:2 num:t toc:nil \n:nil @:t ::t |:t ^:t -:t f:t *:t <:t date:nil
+#+latex_class: beamer
+#+latex_class_options: [presentation]
+#+beamer_header: \setbeamerfont{institute}{size=\normalsize}
+#+beamer_header: \setbeamertemplate{frametitle continuation}{}
+#+beamer_header: \setbeameroption{show notes on second screen}
+#+exclude_tags: noexport
+
+* Agenda
+:PROPERTIES:
+:not-in-toc:
+:BEAMER_env: frame
+:END:
+#+beamer: \tableofcontents
+
+* What is Live Update?
+** Agenda
+#+beamer: \tableofcontents[current]
+
+** What is Live Update?
+- It's NOT: live patching, live migration.
+- Updates the kernel or hypervisor with minimal disruption for underlying
+  workloads.
+- Most commonly used for hypervisors.
+- Can also be used by other workloads to reduce kernel patching downtime.
+- Multiple cloud providers working together to upstream it.
+
+** Notes :B_noteNH:
+:PROPERTIES:
+:BEAMER_ENV: noteNH
+:END:
+
+* High level overview
+** Agenda
+#+beamer: \tableofcontents[current]
+
+** Live update flow
+- The system is in normal state.
+- The system software starts the live update process.
+- Serializes state keeping VMs active but with limited capabilities.
+- Pauses VMs and does final serialization.
+- Loads and next kernel and hands over the serialized data.
+- Next kernel deserializes the data.
+- Resumes VM, returning normal operation.
+
+*** Notes :B_noteNH:
+:PROPERTIES:
+:BEAMER_ENV: noteNH
+:END:
+- In "serialization" part, mention the role of system software and kernel.
+- Note the similarities to live migration.
+
+** What gets preserved?
+- VM metadata
+- VM memory
+- Passthrough devices
+- IOMMU mappings
+
+*** Notes :B_noteNH:
+:PROPERTIES:
+:BEAMER_env: noteNH
+:END:
+
+* Building blocks
+** Agenda
+#+beamer: \tableofcontents[current]
+*** Notes :B_noteNH:
+:PROPERTIES:
+:BEAMER_env: noteNH
+:END:
+
+- Complex feature, not easy to do it in one go.
+- Upstreaming as a set of building blocks instead.
+
+** Kexec Handover (KHO)
+- Creates a mechanism for kernel-to-kernel communication.
+- Provides mechanism to mark memory as preserved.
+- Makes sure preserved memory does not get used by the next kernel.
+- Passes this information over kexec.
+
+*** Notes :B_noteNH:
+:PROPERTIES:
+:BEAMER_ENV: noteNH
+:END:
+- Explain that it is not possible to preserve user memory using this.
+- But it can be used for non-liveupdate cases as well, like ~reserve_mem~ for
+  example.
+
+** KHO: Memory preservation
+#+begin_src c
+int kho_preserve_folio(struct folio *folio);
+int kho_unpreserve_folio(struct folio *folio);
+struct folio *kho_restore_folio(phys_addr_t phys);
+#+end_src
+
+** KHO: Memory preservation
+#+beamer: \includegraphics[width=\textwidth]{kho_bitmaps.pdf}
+
+** KHO: Preparing :noexport:
+- Before the system is ready for kexec, KHO must be notified so it can prepare.
+- On this notification, serializes preserved memory to bitmaps.
+
+*** Notes :B_noteNH:
+:PROPERTIES:
+:BEAMER_env: noteNH
+:END:
+- Mention that the finalization hook is going away.
+
+** KHO: Booting up
+- Pre-reserved scratch area for early boot.
+- Passing KHO metadata: setup data on x86, chosen node in FDT on arm64.
+
+#+begin_src c
+struct kho_data {
+	__u64 fdt_addr;
+	__u64 fdt_size;
+	__u64 scratch_addr;
+	__u64 scratch_size;
+} __attribute__((packed));
+#+end_src
+
+#+begin_src dts
+chosen {
+	linux,kho-fdt = <...>;
+	linux,kho-scratch = <...>;
+};
+#+end_src
+
+*** Notes :B_noteNH:
+:PROPERTIES:
+:BEAMER_env: noteNH
+:END:
+- Mention that kexec image and all early boot allocations go in scratch.
+- Mention that chosen node gets set at kexec load time.
+
+** KHO: Booting up
+- On early boot, only allocate from scratch.
+
+#+begin_src c
+enum memblock_flags choose_memblock_flags(void)
+{
+	if (kho_scratch_only)
+		return MEMBLOCK_KHO_SCRATCH;
+	[...]
+}
+#+end_src
+
+- After early boot, mark preserved pages as reserved and turn off scratch-only
+  mode
+- Reserved pages don't get released to buddy allocator.
+
+** Live Update Orchestrator (LUO)
+- LUO provides a way for userspace to control the live update process.
+- Allows marking which resources to preserve.
+- Provides a state machine to co-ordinate all the components.
+- API is exposed through a set of IOCTLs.
+
+*** Notes :B_noteNH:
+:PROPERTIES:
+:BEAMER_ENV: noteNH
+:END:
+- Can't preserve everything since too much state.
+- Mention that this is the next layer since it lets userspace actually do stuff.
+- Maybe mention that ~/dev/liveupdate~ can only be opened once and that luod
+  must control it?
+
+** LUO: States :noexport:
+- \textcolor{blue}{Normal}: No live update in progress.
+- \textcolor{blue}{Prepared}: Kernel is prepared to do a live update. Devices and resources
+  operate in limited capacity.
+- \textcolor{blue}{Frozen}: The final reboot event has been sent. Last chance for the kernel to
+  serialize.
+- \textcolor{blue}{Updated}: System has rebooted into next kernel and can start deserializing
+  devices and resources.
+- \textcolor{blue}{Normal}: The system is back to normal functionality.
+
+** LUO: States
+#+begin_src c
+struct liveupdate_ioctl_set_event {
+	__u32	size;
+	__u32	event;
+};
+#+end_src
+
+- ~LIVEUPDATE_PREPARE~: Normal -> Prepared
+- ~LIVEUPDATE_FREEZE~: Prepared -> Frozen
+- ~LIVEUPDATE_FINISH~: Updated -> Normal
+- ~LIVEUPDATE_CANCEL~: Prepared -> Normal
+
+*** Notes :B_noteNH:
+:PROPERTIES:
+:BEAMER_env: noteNH
+:END:
+- Explain all the states.
+- FREEZE: Sent from ~reboot(2)~.
+
+** LUO: File Descriptors
+- Userspace can pass in supported file descriptors to LUO to mark them for
+  preservation.
+- Not any arbitrary FD, only FDs for supported file types.
+
+#+begin_src c
+struct liveupdate_ioctl_fd_preserve {
+	__u32		size;
+	__s32		fd;
+	__aligned_u64	token;
+};
+#+end_src
+
+*** Notes :B_noteNH:
+:PROPERTIES:
+:BEAMER_env: noteNH
+:END:
+- Give some examples of FDs in Linux: memfd, sockets, VFIO, IOMMUFD, KVM, etc.
+- Mention some properties that can change with restore FDs, taking memfd as
+  example.
+- Mention that the token can be used to identify the FD after reboot.
+
+** LUO: Subsystems
+- For things that can't be described by a FD.
+- Examples: PCI, NVME, ftrace, etc.
+
+*** Notes :B_noteNH:
+:PROPERTIES:
+:BEAMER_env: noteNH
+:END:
+- Mention that not much work done on this so use cases and usage model still
+  unclear.
+
+** Memory File Descriptor (memfd)
+- memfd attaches a file descriptor to anonymous memory.
+- State preserved: memory contents, size and position.
+- After preserve, cannot add or remove pages from the memfd.
+- Limitations: no sparseness, no swap.
+
+*** Notes :B_noteNH:
+:PROPERTIES:
+:BEAMER_env: noteNH
+:END:
+- Mention that memfd is the first user of LUO.
+- Mention that pages are pinned and holes are filled.
+
+** memfd: preservation format
+#+begin_src dts
+/ {
+	pos = <0x...>;
+	size = <0x...>;
+	folios = [array of memfd_luo_preserved_folio]
+};
+#+end_src
+
+#+begin_src c
+struct memfd_luo_preserved_folio {
+	u64 foliodesc;
+	u64 index;
+};
+#+end_src
+
+- Foliodesc: bottom 12 bits for flags, rest for PFN.
+
+*** Notes :B_noteNH:
+:PROPERTIES:
+:BEAMER_env: noteNH
+:END:
+- Explain why we use FDT.
+
+** VFIO, PCI, IOMMU, etc...
+
+* Upstream status
+** Agenda
+#+beamer: \tableofcontents[current]
+
+** Upstream status
+- KHO is in mainline. See ~kernel/kexec_handover.c~ and
+  ~include/linux/kexec_handover.h~.
+- LUO v4 sent out few days ago. [[https://lore.kernel.org/linux-mm/20250929010321.3462457-1-pasha.tatashin@soleen.com/T/#u][\color{blue}\underline{Patch posting}]]. It is
+  starting to stabilize and is on path to upstream soon.
+- memfd support will get merged with the LUO patches.
+- RFCs for PCI, VFIO, IOMMU out.
+
+* Future work
+** Agenda
+#+beamer: \tableofcontents[current]
+
+** Future work
+- Supporting more subsystems: huge pages, VFIO, IOMMU, PCI, etc.
+- Implementing luod.
+- Improving performance for reboots.
+- Defining a mechanism for kernels to negotiate versions to enable rollback and
+  roll forward to a wider set of kernels.
+- Testing and validation.
+
+* :B_frame:
+:PROPERTIES:
+:not-in-toc:
+:BEAMER_env: frame
+:END:
+
+#+beamer: \begin{center}
+#+beamer: \Huge Thank you for attending the talk!
+#+beamer: \end{center}
+
+* :B_frame:
+:PROPERTIES:
+:not-in-toc:
+:BEAMER_env: frame
+:END:
