@@ -1,0 +1,224 @@
+#+title: Userspace memory persistence over kexec
+#+author: Pratyush Yadav <pratyush@kernel.org>
+#+options: TeX:t LaTeX:t skip:nil d:nil todo:t pri:nil tags:not-in-toc
+#+options: H:2 num:t toc:nil \n:nil @:t ::t |:t ^:t -:t f:t *:t <:t date:nil
+#+latex_class: beamer
+#+latex_class_options: [presentation]
+#+beamer_header: \setbeamerfont{institute}{size=\normalsize}
+#+beamer_header: \institute{Amazon Web Services}
+#+beamer_header: \setbeamertemplate{frametitle continuation}{}
+#+exclude_tags: noexport
+
+#+name: setup-minted
+#+begin_src emacs-lisp :exports results :results silent
+(setq org-latex-src-block-backend 'minted)
+(add-to-list 'org-latex-packages-alist '("" "minted" nil))
+(setq org-latex-minted-options '(("frame" "single")))
+(setq org-latex-pdf-process
+      '("pdflatex -shell-escape -interaction nonstopmode -output-directory %o %f"
+        "pdflatex -shell-escape -interaction nonstopmode -output-directory %o %f"
+        "pdflatex -shell-escape -interaction nonstopmode -output-directory %o %f"))
+#+end_src
+
+* Agenda
+:PROPERTIES:
+:not-in-toc:
+:BEAMER_env: frame
+:END:
+#+beamer: \tableofcontents
+
+* Why?
+** Agenda
+#+beamer: \tableofcontents[current]
+
+** Why?
+#+attr_beamer: :overlay <+->
+- You need to reboot to apply kernel patches.
+- For stateless hosts this isn't a big problem.
+- It is a bigger problem for stateful hosts like database servers or storage
+  nodes.
+- Also useful if you don't control underlying workload.
+
+* How?
+** Agenda
+#+beamer: \tableofcontents[current]
+
+** How?
+- Allow handing over userspace memory over kexec.
+- Applications aware of being kexec-ed can serialize/deserialize state.
+- For unaware applications, we can use Checkpoint/Restore in Userspace (CRIU).
+
+** How?
+#+beamer: \includegraphics<1>[width=\textwidth,page=1]{lpc_2024_final.pdf}
+#+beamer: \includegraphics<2>[width=\textwidth,page=2]{lpc_2024_final.pdf}
+#+beamer: \includegraphics<3>[width=\textwidth,page=3]{lpc_2024_final.pdf}
+#+beamer: \includegraphics<4>[width=\textwidth,page=4]{lpc_2024_final.pdf}
+#+beamer: \includegraphics<5>[width=\textwidth,page=5]{lpc_2024_final.pdf}
+#+beamer: \includegraphics<6>[width=\textwidth,page=6]{lpc_2024_final.pdf}
+#+beamer: \includegraphics<7>[width=\textwidth,page=7]{lpc_2024_final.pdf}
+
+* Design
+** Agenda
+#+beamer: \tableofcontents[current]
+
+** System call vs file system?
+- Two ways to implement the feature.
+- Similar file systems already proposed in the past like guestmemfs, pkram,
+  pkernfs, etc.
+
+** System call
+A new system call named ~kmho()~ with two modes of operation: take over memory
+and hand over memory.
+
+#+begin_src c
+int kmho(unsigned int opcode, void *op);
+#+end_src
+
+** System call
+For handing over memory (before kexec), one can call the ~KMHO_HANDOVER~
+operation. ~op~ should be a ~struct kmho_op_handover~.
+
+#+begin_src c
+struct kmho_range_handover {
+	unsigned long base;
+	unsigned long length;
+};
+
+struct kmho_op_handover {
+	unsigned long key;
+	unsigned long num_ranges;
+	struct kmho_range_handover *ranges;
+};
+#+end_src
+
+** System call
+An example call would look like:
+
+#+begin_src c
+struct kmho_range_handover range = {
+	.base = base,
+	.length = len,
+};
+
+struct kmho_op_handover op = {
+	.key = 0xabcd1234,
+	.num_ranges = 1,
+	.ranges = &range,
+};
+kmho(KMHO_HANDOVER, &op);
+#+end_src
+
+** System call
+For taking over memory (after kexec), one can call the ~KMHO_TAKEOVER~
+operation. ~op~ should be a ~struct kmho_op_takeover~.
+
+#+begin_src c
+struct kmho_range_takeover {
+	unsigned long base;
+	unsigned long len;
+	unsigned long remap_addr;
+};
+
+struct kmho_op_takeover {
+	unsigned long key;
+	unsigned long num_ranges;
+	struct kmho_range_takeover *ranges;
+};
+#+end_src
+
+** System call
+An example call would look like:
+
+#+begin_src c
+struct kmho_range_takeover range = {
+	.base = base, // memory addr during handover
+	.length = len,
+	.remap_addr = new_addr, // New addr to map to
+};
+
+struct kmho_op_takeover op = {
+	.key = 0xabcd1234,
+	.num_ranges = 1,
+	.ranges = &range,
+};
+kmho(KMHO_TAKEOVER, &op);
+#+end_src
+
+** File system
+Mount file system:
+#+begin_src bash
+mount -t khofs none /khofs
+#+end_src
+
+Mapping memory would look like:
+
+#+begin_src c
+fd = open("/khofs/my_mem", O_RDWR | O_CREAT | O_EXCL,
+	  0600);
+mem = mmap(NULL, length, PROT_READ | PROT_WRITE,
+	   MAP_SHARED, fd, 0);
+// Do stuff...
+munmap(mem, length);
+close(fd);
+#+end_src
+
+** Comparison
+FS:
+- Naming and permissions easier.
+- Can use same old APIs.
+
+Syscall:
+- Using syscall is simpler.
+- Not possible to have anonymous memory with FS.
+
+* Current state
+** Agenda
+#+beamer: \tableofcontents[current]
+
+** Current state
+- Implemented proof-of-concept using system call.
+- Some hacky patches for CRIU to use this functionality.
+- Plan to send out RFC soon.
+
+** Demo!
+https://asciinema.org/a/3LZjzIe53Uvdhi7GenUxakrqy
+
+* Future extensions
+** Agenda
+#+beamer: \tableofcontents[current]
+
+** Future extensions
+- Handover swap contents across kexec.
+- Handover page cache across kexec.
+
+* :B_frame:
+:PROPERTIES:
+:not-in-toc:
+:BEAMER_env: frame
+:END:
+
+#+beamer: \begin{center}
+#+beamer: \Huge Thank you for attending the talk!
+#+beamer: \end{center}
+
+* :B_frame:
+:PROPERTIES:
+:not-in-toc:
+:BEAMER_env: frame
+:END:
+
+* FAQs
+:PROPERTIES:
+:UNNUMBERED: t
+:END:
+
+** What about fragmentation?
+- Yes, if you use ~kmho()~ the new kernel gets the old kernel's fragmentation.
+- But that is an independent problem.
+- We should solve that regardless of whether you use ~kmho()~ or not.
+
+** Do we really need a new system call?
+- We can overload ~mmap()~, ~munmap()~, and ~mremap()~ to do this.
+- This makes interface of these system calls more complex.
+- Having a new system call keeps things nicely separated, and leaves more room
+  for growth later.
