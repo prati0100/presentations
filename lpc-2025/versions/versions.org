@@ -1,0 +1,137 @@
+#+title: Managing serialization versions for LUO objects
+#+author: Pratyush Yadav <pratyush@kernel.org>
+#+options: TeX:t LaTeX:t skip:nil d:nil todo:t pri:nil tags:not-in-toc
+#+options: H:2 num:t toc:nil \n:nil @:t ::t |:t ^:t -:t f:t *:t <:t date:nil
+#+latex_class: beamer
+#+latex_class_options: [presentation]
+#+latex_header: \usepackage{minted}
+#+beamer_header: \setbeamerfont{institute}{size=\normalsize}
+#+beamer_header: \setbeamertemplate{frametitle continuation}{}
+#+beamer_header: \setbeameroption{hide notes}
+#+beamer_header: \setbeamercolor{block body}{bg=structure!10}
+#+beamer_header: \setbeamercolor{block title}{bg=structure!20}
+#+exclude_tags: noexport
+
+* Agenda
+:PROPERTIES:
+:not-in-toc:
+:BEAMER_env: frame
+:END:
+#+beamer: \tableofcontents
+
+* LUO object versions
+** Agenda
+#+beamer: \tableofcontents[current]
+
+** LUO object versions
+- As LUO and subsystems evolve, the serialization formats will change.
+- To fix bugs, improve performance, support new features, etc.
+- If the next kernel doesn't understand the versions, live update will fail.
+
+* Phase 1: list versions in vmlinux
+** Agenda
+#+beamer: \tableofcontents[current]
+
+** List versions in vmlinux
+- Put all the LUO version strings in a vmlinux section (say
+  ~.liveupdate_versions~).
+- Userspace tooling (like luod) can read the list and figure out if there is
+  incompatibility.
+- Don't reboot if a participating FD has incompatible version.
+
+** Data format
+#+begin_src c
+struct liveupdate_ver_hdr {
+	u32 magic;
+	u32 version;
+};
+
+struct liveupdate_ver_table {
+	struct liveupdate_ver_hdr hdr;
+	char versions[][LIVEUPDATE_HNDL_COMPAT_LENGTH];
+};
+
+LIVEUPDATE_FILE_HANDLER(memfd_luo_handler, MEMFD_LUO_FH_COMPATIBLE,
+			&memfd_luo_file_ops);
+#+end_src
+
+*** Question: :B_block:
+:PROPERTIES:
+:BEAMER_env: block
+:END:
+What ABI guarantees do we make for this?
+
+** Current status
+- RFC of this posted this Thursday: [[https://lore.kernel.org/linux-mm/20251211042624.175517-1-pratyush@kernel.org/T/#u][\color{blue}\underline{link}]].
+
+* Phase 2: support multiple versions
+** Agenda
+#+beamer: \tableofcontents[current]
+
+** Support multiple versions
+- Actually lets you roll out a new serialization version in your fleet.
+- More flexible rolling forward and back.
+- Upstream gets core LUO infra, and upstream can decide how many versions it
+  supports.
+- CSP can have additional versions downstream.
+
+** Listing all versions in vmlinux
+- Add the concept of a LUO "type".
+- Each LUO type is one file handler or FLB (example: "memfd").
+- Each type can have multiple versions.
+
+#+begin_src c
+struct liveupdate_ver {
+	char type[LIVEUPDATE_HNDL_COMPAT_LENGTH];
+	char version[LIVEUPDATE_HNDL_COMPAT_LENGTH];
+};
+
+struct liveupdate_ver_table {
+	struct liveupdate_ver_hdr hdr;
+	struct liveupdate_ver versions[];
+};
+#+end_src
+
+** LUO file handler set
+- Set of file handlers for the same type.
+- LUO chooses the right handler based on what userspace configured.
+
+#+begin_src c
+struct liveupdate_fh_set {
+	char type[LIVEUPDATE_HNDL_COMPAT_LENGTH];
+	struct list_head handlers;
+	struct liveupdate_file_handler *current;
+	// ...
+};
+#+end_src
+
+** Choosing the version
+- Based on version info of both kernels, userspace (luod) can "negotiate" the
+  versions LUO should use.
+- New ioctl: ~LIVEUPDATE_CMD_SET_VERSION~.
+
+#+begin_src c
+struct liveupdate_ioctl_set_version {
+	__u32 size;
+	__u8 type[LIVEUPDATE_HNDL_COMPAT_LENGTH];
+	__u8 version[LIVEUPDATE_HNDL_COMPAT_LENGTH];
+};
+#+end_src
+
+** Alternative: serialize all versions
+- Suggested by Jason Gunthorpe earlier.
+- Always create serialized state of all the versions LUO knows.
+- No need for UAPI exposure.
+- More expensive for performance.
+- Can be inflexible: two different versions might need the file to be in
+  different states.
+
+* :B_frame:
+:PROPERTIES:
+:not-in-toc:
+:BEAMER_env: frame
+:END:
+
+#+beamer: \begin{center}
+#+beamer: \Huge Thank you for attending the talk!
+#+beamer: \end{center}
