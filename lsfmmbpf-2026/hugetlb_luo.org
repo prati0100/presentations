@@ -1,0 +1,152 @@
+#+title: HugeTLB preservation using LUO
+#+author: Pratyush Yadav <pratyush@kernel.org>
+#+options: TeX:t LaTeX:t skip:nil d:nil todo:t pri:nil tags:not-in-toc
+#+options: H:2 num:t toc:nil \n:nil @:t ::t |:t ^:t -:t f:t *:t <:t date:nil
+#+latex_class: beamer
+#+latex_class_options: [presentation]
+#+latex_header: \usepackage{minted}
+#+beamer_header: \setbeamerfont{institute}{size=\normalsize}
+#+beamer_header: \setbeamertemplate{frametitle continuation}{}
+#+beamer_header: \setbeameroption{hide notes}
+#+beamer_header: \institute{Google}
+#+exclude_tags: noexport
+
+* Agenda
+:PROPERTIES:
+:not-in-toc:
+:BEAMER_env: frame
+:END:
+#+beamer: \tableofcontents
+
+* Background
+** Agenda
+#+beamer: \tableofcontents[current]
+
+** Live Update
+- Live update is a system maintenance workflow that allows a full kernel update
+  without terminating running workload.
+- Uses kexec to boot into the new kernel.
+- Passes state of memory and devices to the next kernel.
+- Main use case is hypervisor live update without terminating VMs.
+
+** Kexec Handover (KHO)
+- Used for passing memory from current kernel to next via kexec.
+- Provides kernel APIs to mark memory as preserved and to restore it on next
+  boot.
+- Only provides kernel APIs, no uAPI.
+
+** Live Update Orchestrator (LUO)
+ - Exposes uAPIs for userspace to manage the liveupdate flow.
+ - Allows userspace to mark resources to preserve and to restore them.
+ - Resources are identified by file descriptors.
+ - Provides kernel API for subsystems to hook into.
+ - Manages ownership and lifecycle of preserved resources.
+ - In mainline since v6.19.
+
+** LUO File-Lifecycle-Bound State (FLB)
+- Global state managed by LUO for a given file type.
+- Lifecycle of state is tied to files of that managed by LUO.
+- Proposed patches on the list, but not mainline yet because no user.
+
+** memfd
+- First subsystem to use LUO.
+- shmem-backed memfd preservation in mainline since v6.19:
+  [[https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/mm/memfd_luo.c][\color{blue}\underline{link}]]
+
+* HugeTLB preservation
+** Agenda
+#+beamer: \tableofcontents[current]
+
+** Use case
+- Back guest memory.
+- Possibly in the future: used with live update for other workloads like
+  in-memory caches for databases or storage servers.
+
+** Design goals
+- Use via memfd.
+- Minimize amount of state preserved. Re-initialize as much as possible.
+- Minimize changes to HugeTLB core.
+
+** Preservation
+1. Freeze inode: ~hugetlb_i_freeze(inode, true)~.
+2. Save metadata: position, size, hugepage order.
+   ~i_size_read(inode)~, ~file->f_pos~, ~h->order~
+3. KHO-preserve each folio (~kho_preserve_folio()~).
+4. Store PFN and index of each folio in an array: ~folio_pfn()~, ~folio->index~.
+
+** Inode freezing
+- Once the state of the file is serialized, changing the filemap needs to be
+  disallowed.
+- This prevents file state going out of sync with serialized state.
+
+** Inode freezing
+Option 1:
+- Add a flag in ~hugetlbfs_inode_info~. Check it on truncation, growing, hole
+  punching. Similar to seals.
+- Pin folios to prevent migration and compaction.
+- shmem preservation does this.
+
+Option 2:
+- Make filemap aware of freezing.
+- Add a new flag: ~AS_FROZEN~.
+- Check this flag before any operations that modify filemap.
+- Challenge: ~filemap_remove_folio()~ can not fail. So file systems still need
+  to check for ~AS_FROZEN~ in setattr or fallocate.
+
+** Retrieval
+1. Get memfd file: ~memfd_alloc_file()~.
+2. Set pos and size: ~vfs_setpos()~, ~inode->i_size~.
+3. Set up reservation map: ~region_chg()~, ~region_add()~.
+4. Charge reservations to cgroup: ~hugetlb_cgroup_charge_cgroup_rsvd()~.
+
+** Retrieval
+5. [@5] Restore the folios: ~kho_restore_folio()~, ~init_new_hugetlb_folio()~, ...
+6. Insert the folios to hstate: ~hugetlb_vmemmap_optimize_folios()~,
+   ~account_new_hugetlb_folio()~, ~list_move(&folio->lru,
+   &h->hugepage_activelist)~, ...
+7. Add folios to filemap: ~hugetlb_add_to_page_cache()~.
+8. Charge cgroup: ~hugetlb_cgroup_charge_cgroup()~,
+   ~hugetlb_cgroup_commit_charge()~, ~mem_cgroup_charge_hugetlb()~.
+
+** Gigantic page pre-allocation
+- On boot, HugeTLB parses cmdline and pre-allocates pages.
+- With live update, this might lead to over-allocation.
+- Say 100G system, 90 1G hugepages needed. Say 5 1G pages in LUO memfd.
+- After KHO boot, HugeTLB allocates 90 pages, then LUO restores the file, adding 5 more.
+- System now has 95 hugepages.
+
+** Gigantic page pre-allocation
+Suggested solution:
+- Count number of hugepages preserved for each hstate in HugeTLB FLB.
+- During boot, read FLB data and subtract the preserved pages for hstate to get
+  target for allocation.
+- Resulting patch is fairly small: ~60 insertions, ~20 deletions.
+
+** Challenge: HugeTLB CMA
+- If gigantic pages are backed by CMA, need to insert them to CMA after restore.
+- No mechanism for extending CMA currently present.
+- Current patches disable HugeTLB CMA if liveupdate is enabled (not the config,
+  but via the ~liveupdate=1~ cmdline).
+- Possible solution: allow preserving CMA. Restore it on hugetlb init. Would
+  also be useful for preserving DMA buffers.
+- Fix not planned for initial version.
+
+* Current status
+** Agenda
+#+beamer: \tableofcontents[current]
+
+** Current status
+- RFC posted on the list: [[https://lore.kernel.org/linux-mm/20251206230222.853493-1-pratyush@kernel.org/T/#u][\color{blue}\underline{link}]].
+- Rework of some KHO infrastructure to work nicely with boot time
+  pre-allocation: [[https://lore.kernel.org/kexec/20260429133928.850721-1-pratyush@kernel.org/T/#u][\color{blue}\underline{link}]].
+- Plan to post v1 after collecting feedback.
+
+* :B_frame:
+:PROPERTIES:
+:not-in-toc:
+:BEAMER_env: frame
+:END:
+
+#+beamer: \begin{center}
+#+beamer: \Huge Thank you for attending!
+#+beamer: \end{center}
